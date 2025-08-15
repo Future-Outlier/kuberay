@@ -969,19 +969,29 @@ func (r *RayClusterReconciler) createWorkerPod(ctx context.Context, instance ray
 func (r *RayClusterReconciler) buildHeadPod(ctx context.Context, instance rayv1.RayCluster) corev1.Pod {
 	logger := ctrl.LoggerFrom(ctx)
 	podName := utils.PodName(instance.Name, rayv1.HeadNode, !utils.IsDeterministicHeadPodNameEnabled())
-	fqdnRayIP := utils.GenerateFQDNServiceName(ctx, instance, instance.Namespace) // Fully Qualified Domain Name
+	fqdnRayIP := utils.GenerateFQDNServiceName(ctx, instance, instance.Namespace)
 
-	// The Ray head port used by workers to connect to the cluster (GCS server port for Ray >= 1.11.0, Redis port for older Ray.)
 	headPort := common.GetHeadPort(instance.Spec.HeadGroupSpec.RayStartParams)
 	autoscalingEnabled := utils.IsAutoscalingEnabled(&instance.Spec)
 	podConf := common.DefaultHeadPodTemplate(ctx, instance, instance.Spec.HeadGroupSpec, podName, headPort)
+
+	// Add existing sidecar containers
 	if len(r.options.HeadSidecarContainers) > 0 {
 		podConf.Spec.Containers = append(podConf.Spec.Containers, r.options.HeadSidecarContainers...)
 	}
+
+	// Check if this RayCluster is created by a RayJob with SidecarMode
+	if creatorCRDType := getCreatorCRDType(instance); creatorCRDType == utils.RayJobCRD {
+		if sidecarContainer, err := r.getSidecarContainerForRayJob(ctx, instance); err == nil && sidecarContainer != nil {
+			podConf.Spec.Containers = append(podConf.Spec.Containers, *sidecarContainer)
+			logger.Info("Added job submitter sidecar container to head pod", "sidecarName", sidecarContainer.Name)
+		}
+	}
+
 	logger.Info("head pod labels", "labels", podConf.Labels)
 	creatorCRDType := getCreatorCRDType(instance)
 	pod := common.BuildPod(ctx, podConf, rayv1.HeadNode, instance.Spec.HeadGroupSpec.RayStartParams, headPort, autoscalingEnabled, creatorCRDType, fqdnRayIP)
-	// Set raycluster instance as the owner and controller
+
 	if err := controllerutil.SetControllerReference(&instance, &pod, r.Scheme); err != nil {
 		logger.Error(err, "Failed to set controller reference for raycluster pod")
 	}
@@ -1583,4 +1593,30 @@ func setDefaults(instance *rayv1.RayCluster) {
 			instance.Spec.WorkerGroupSpecs[i].RayStartParams = map[string]string{}
 		}
 	}
+}
+
+// 添加新方法來獲取 RayJob 的 sidecar 容器
+func (r *RayClusterReconciler) getSidecarContainerForRayJob(ctx context.Context, instance rayv1.RayCluster) (*corev1.Container, error) {
+	// Find the RayJob that created this RayCluster
+	rayJobs := &rayv1.RayJobList{}
+	if err := r.Client.List(ctx, rayJobs, client.InNamespace(instance.Namespace)); err != nil {
+		return nil, err
+	}
+
+	for _, rayJob := range rayJobs.Items {
+		// Check if this RayJob created this RayCluster
+		if rayJob.Status.RayClusterName == instance.Name {
+			// Check if this RayJob uses SidecarMode
+			if rayJob.Spec.SubmissionMode == rayv1.SidecarMode {
+				// Create the sidecar container for this RayJob
+				sidecarContainer, err := common.CreateJobSubmitterSidecar(&rayJob, &instance)
+				if err != nil {
+					return nil, err
+				}
+				return &sidecarContainer, nil
+			}
+		}
+	}
+
+	return nil, nil
 }

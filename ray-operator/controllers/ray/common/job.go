@@ -64,6 +64,11 @@ func GetK8sJobCommand(rayJobInstance *rayv1.RayJob) ([]string, error) {
 	entrypointNumGpus := rayJobInstance.Spec.EntrypointNumGpus
 	entrypointResources := rayJobInstance.Spec.EntrypointResources
 
+	// For SidecarMode, use localhost since sidecar is in the same pod as Ray head
+	if rayJobInstance.Spec.SubmissionMode == rayv1.SidecarMode {
+		address = "localhost:8265"
+	}
+
 	// add http:// if needed
 	if !strings.HasPrefix(address, "http://") {
 		address = "http://" + address

@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -258,6 +259,14 @@ func (r *RayJobReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 				return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
 			}
 			if shouldUpdate := checkK8sJobAndUpdateStatusIfNeeded(ctx, rayJobInstance, job); shouldUpdate {
+				break
+			}
+		}
+
+		// Add SidecarMode status checking
+		if rayJobInstance.Spec.SubmissionMode == rayv1.SidecarMode {
+			// Check sidecar container status in the head pod
+			if shouldUpdate := r.checkSidecarContainerStatus(ctx, rayJobInstance); shouldUpdate {
 				break
 			}
 		}
@@ -981,5 +990,65 @@ func checkTransitionGracePeriodAndUpdateStatusIfNeeded(ctx context.Context, rayJ
 		rayJob.Status.Message = "JobDeploymentStatus does not transition to Complete or Failed within the grace period after JobStatus reaches a terminal state."
 		return true
 	}
+	return false
+}
+
+func (r *RayJobReconciler) checkSidecarContainerStatus(ctx context.Context, rayJobInstance *rayv1.RayJob) bool {
+	logger := ctrl.LoggerFrom(ctx)
+
+	// Get the RayCluster instance
+	rayClusterInstance := &rayv1.RayCluster{}
+	namespacedName := types.NamespacedName{
+		Namespace: rayJobInstance.Namespace,
+		Name:      rayJobInstance.Status.RayClusterName,
+	}
+
+	if err := r.Client.Get(ctx, namespacedName, rayClusterInstance); err != nil {
+		logger.Error(err, "Failed to get RayCluster for sidecar status check")
+		return false
+	}
+
+	// Get the head pod
+	headPods := &corev1.PodList{}
+	headPodLabels := map[string]string{
+		utils.RayClusterLabelKey:  rayClusterInstance.Name,
+		utils.RayNodeTypeLabelKey: string(rayv1.HeadNode),
+	}
+
+	if err := r.Client.List(ctx, headPods, client.InNamespace(rayJobInstance.Namespace), client.MatchingLabels(headPodLabels)); err != nil {
+		logger.Error(err, "Failed to list head pods for sidecar status check")
+		return false
+	}
+
+	if len(headPods.Items) == 0 {
+		logger.Info("No head pods found for sidecar status check")
+		return false
+	}
+
+	headPod := headPods.Items[0]
+	sidecarContainerName := "ray-job-submitter-sidecar"
+
+	finished, success, err := common.GetSidecarContainerStatus(&headPod, sidecarContainerName)
+	if err != nil {
+		logger.Error(err, "Failed to get sidecar container status")
+		return false
+	}
+
+	if finished {
+		if success {
+			logger.Info("Sidecar container finished successfully")
+			// The job submission was successful, continue with normal job status checking
+			return false
+		}
+
+		logger.Info("Sidecar container failed, marking RayJob as failed")
+		rayJobInstance.Status.JobDeploymentStatus = rayv1.JobDeploymentStatusFailed
+		rayJobInstance.Status.Reason = rayv1.SubmissionFailed
+		rayJobInstance.Status.Message = "Job submission failed in sidecar container"
+		return true
+
+	}
+
+	// Sidecar container is still running
 	return false
 }
