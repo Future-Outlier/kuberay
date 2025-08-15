@@ -82,6 +82,7 @@ const (
 	K8sJobMode      JobSubmissionMode = "K8sJobMode"      // Submit job via Kubernetes Job
 	HTTPMode        JobSubmissionMode = "HTTPMode"        // Submit job via HTTP request
 	InteractiveMode JobSubmissionMode = "InteractiveMode" // Don't submit job in KubeRay. Instead, wait for user to submit job and provide the job submission ID.
+	SidecarMode     JobSubmissionMode = "SidecarMode"     // Submit job via sidecar container in head pod.
 )
 
 type DeletionPolicyType string
